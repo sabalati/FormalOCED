@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+FOCED object-centric pipeline (no Alloy runtime):
+- Parse XES (pm4py or XML fallback) and OCEL JSON (pm4py)
+- Build object-centric model: Events, Objects, Event-Object links
+- Derive additional Objects from XES event attributes (Order, Item, Resource, etc.)
+- Enforce Alloy-model logic in Python:
+  * ValidAttrs: attr names/values are non-empty strings
+  * Time ordering: normalize timestamps; drop unparseable ones
+  * MaxObserveLimit: cap #objects per event
+- Backup to JSON + audit log
+- Project to Neo4j with constraints/indexes
+- Example Cypher queries (Neo4j 5–compatible)
+"""
+
+import os
+import json
+import time
+import uuid
+import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple, Callable
+
+from neo4j import GraphDatabase
+
+# -------------------
+# Optional: pm4py parsers
+# -------------------
+try:
+    from pm4py.objects.log.importer.xes import importer as xes_importer
+    PM4PY_XES = True
+except Exception:
+    PM4PY_XES = False
+
+try:
+    from pm4py.objects.ocel.importer.jsonocel import importer as ocel_json_importer
+    PM4PY_OCEL = True
+except Exception:
+    PM4PY_OCEL = False
+
+# --- pm4py XES constants (new/old paths shim) ---
+try:
+    from pm4py.util.xes_constants import (
+        DEFAULT_NAME_KEY,
+        DEFAULT_TIMESTAMP_KEY,
+        DEFAULT_TRACEID_KEY,
+    )
+except Exception:
+    # Fallback keys if pm4py constants not available
+    DEFAULT_NAME_KEY = "concept:name"
+    DEFAULT_TIMESTAMP_KEY = "time:timestamp"
+    DEFAULT_TRACEID_KEY = "concept:name"
+
+# -------------------
+# Configuration
+# -------------------
+NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASS", "mnbvcxza")
+
+INPUT_FILE = "2013_full.xes"     # or "log.jsonocel" / "log.ocel.json"
+BACKUP_DIR = "backups"
+AUDIT_LOG_FILE = "audit.log"
+
+# Enforced from Alloy logic (implemented in Python)
+MAX_OBSERVES_PER_EVENT = 3
+DROP_UNPARSEABLE_TIMESTAMPS = True
+
+BATCH_SIZE = 1000
+
+# ---- XES: derive extra objects from attributes ----
+# Map event attribute names -> (object_type, object_id_builder)
+# object_id_builder(value:str) -> str (unique id string)
+def _id_direct(v: str) -> str: return str(v)
+def _id_prefixed(prefix: str) -> Callable[[str], str]:
+    return lambda v: f"{prefix}:{str(v)}"
+
+XES_OBJECT_ATTR_KEYS: Dict[str, Tuple[str, Callable[[str], str]]] = {
+    # Order-like
+    "order": ("Order", _id_prefixed("order")),
+    "order:id": ("Order", _id_prefixed("order")),
+    "order_id": ("Order", _id_prefixed("order")),
+    "case:order_id": ("Order", _id_prefixed("order")),
+    # Item / Line item
+    "item": ("Item", _id_prefixed("item")),
+    "item_id": ("Item", _id_prefixed("item")),
+    "lineitem": ("Item", _id_prefixed("item")),
+    # Customer
+    "customer": ("Customer", _id_prefixed("customer")),
+    "customer_id": ("Customer", _id_prefixed("customer")),
+    # Product
+    "product": ("Product", _id_prefixed("product")),
+    "product_id": ("Product", _id_prefixed("product")),
+    # Org / Resource
+    "org:resource": ("Resource", _id_prefixed("res")),
+    "org:group": ("OrgGroup", _id_prefixed("grp")),
+    # Document / Invoice
+    "invoice_id": ("Invoice", _id_prefixed("inv")),
+    "document_id": ("Document", _id_prefixed("doc")),
+}
+
+# Optionally normalize attribute names (lowercase + strip)
+def normalize_key(k: str) -> str:
+    return k.strip().lower()
+
+# Some XES exporters vary keys; you can remap here (e.g., "Order ID" -> "order_id")
+XES_OBJECT_NORMALIZERS: Dict[str, str] = {
+    "order id": "order_id",
+    "item id": "item_id",
+    "product id": "product_id",
+    "customer id": "customer_id",
+}
+
+# -------------------
+# Audit log setup
+# -------------------
+os.makedirs(BACKUP_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=AUDIT_LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("FOCED")
+
+# -------------------
+# FOCED Model
+# -------------------
+class FOCED:
+    """
+    Formal Object-Centric Event Data (simplified):
+      - events: [{id, activity, timestamp, attrs: {k:v}}]
+      - objects: {obj_id: {id, type, attrs:{k:v}}}
+      - event_object: [{event_id, object_id, role?}]
+    """
+    def __init__(self):
+        self.events: List[Dict[str, Any]] = []
+        self.objects: Dict[str, Dict[str, Any]] = {}
+        self.event_object: List[Dict[str, Any]] = []
+
+    def add_object(self, object_id: str, obj_type: str, attrs: Optional[Dict[str, Any]] = None):
+        if object_id not in self.objects:
+            self.objects[object_id] = {"id": object_id, "type": obj_type, "attrs": dict(attrs or {})}
+        else:
+            self.objects[object_id]["attrs"].update(attrs or {})
+
+    def add_event(self, activity: str, timestamp: Optional[str], attrs: Optional[Dict[str, Any]] = None) -> str:
+        e_id = str(uuid.uuid4())
+        self.events.append({
+            "id": e_id,
+            "activity": activity,
+            "timestamp": timestamp,
+            "attrs": dict(attrs or {})
+        })
+        return e_id
+
+    def link_event_object(self, event_id: str, object_id: str, role: Optional[str] = None):
+        self.event_object.append({"event_id": event_id, "object_id": object_id, "role": role})
+
+# -------------------
+# Helpers (Alloy logic)
+# -------------------
+def _is_nonempty_str(x) -> bool:
+    return isinstance(x, str) and x.strip() != ""
+
+def normalize_timestamp(ts: Optional[str]) -> Optional[str]:
+    """
+    Normalize to ISO 8601 if possible; drop if unparseable (to maintain total order).
+    """
+    if ts is None:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt.isoformat()
+    except Exception:
+        log.warning("Unparseable timestamp dropped (ordering enforcement): %s", ts)
+        return None if DROP_UNPARSEABLE_TIMESTAMPS else ts
+
+def enforce_alloy_logic(model: FOCED, max_observes: int = MAX_OBSERVES_PER_EVENT) -> None:
+    """
+    Implements:
+      - ValidAttrs: only keep attrs with non-empty string name/value
+      - Time ordering: normalize timestamps; drop if unparseable
+      - MaxObserveLimit: cap objects linked to a single event to <= max_observes
+    """
+    # ValidAttrs on objects
+    for obj in model.objects.values():
+        clean = {}
+        for k, v in (obj.get("attrs") or {}).items():
+            if _is_nonempty_str(k) and _is_nonempty_str(v):
+                clean[k] = v
+            else:
+                log.info("Dropping invalid object attr (id=%s): %r=%r", obj["id"], k, v)
+        obj["attrs"] = clean
+        if not _is_nonempty_str(obj.get("type", "")):
+            log.info("Object missing/invalid type; setting to 'UnknownType' (id=%s)", obj["id"])
+            obj["type"] = "UnknownType"
+
+    # ValidAttrs + Time ordering on events
+    for ev in model.events:
+        clean = {}
+        for k, v in (ev.get("attrs") or {}).items():
+            if _is_nonempty_str(k) and _is_nonempty_str(v):
+                clean[k] = v
+            else:
+                log.info("Dropping invalid event attr (id=%s): %r=%r", ev["id"], k, v)
+        ev["attrs"] = clean
+        ev["timestamp"] = normalize_timestamp(ev.get("timestamp"))
+        if not _is_nonempty_str(ev.get("activity", "")):
+            log.info("Event missing/invalid activity; setting to 'UNNAMED' (id=%s)", ev["id"])
+            ev["activity"] = "UNNAMED"
+
+    # MaxObserveLimit per event
+    from collections import defaultdict
+    links_by_event: Dict[str, List[int]] = defaultdict(list)
+    for idx, l in enumerate(model.event_object):
+        links_by_event[l["event_id"]].append(idx)
+
+    trimmed = 0
+    keep_mask = [True] * len(model.event_object)
+    for ev_id, idxs in links_by_event.items():
+        if len(idxs) > max_observes:
+            # deterministically keep the first N by original order
+            for j in idxs[max_observes:]:
+                keep_mask[j] = False
+                trimmed += 1
+            log.info("Event %s had %d objects; trimmed to %d", ev_id, len(idxs), max_observes)
+    if trimmed:
+        model.event_object = [l for i, l in enumerate(model.event_object) if keep_mask[i]]
+        log.info("Total trimmed Observe links: %d", trimmed)
+
+# -------------------
+# Parsing: XES + OCEL
+# -------------------
+def _derive_xes_extra_objects(model: FOCED, e_id: str, event_attrs: Dict[str, str]) -> None:
+    """
+    From a parsed XES event's attributes, derive extra objects and link them to the event.
+    - Uses XES_OBJECT_ATTR_KEYS and XES_OBJECT_NORMALIZERS.
+    """
+    for raw_k, v in event_attrs.items():
+        if not _is_nonempty_str(v):
+            continue
+        k_norm = normalize_key(raw_k)
+        # normalize key if present in remap
+        k_norm = XES_OBJECT_NORMALIZERS.get(k_norm, k_norm)
+        if k_norm in XES_OBJECT_ATTR_KEYS:
+            otype, id_builder = XES_OBJECT_ATTR_KEYS[k_norm]
+            oid = id_builder(str(v))
+            model.add_object(oid, otype, attrs={raw_k: str(v)})
+            model.link_event_object(e_id, oid, role=k_norm)
+
+def parse_xes_pm4py(path: str) -> FOCED:
+    log.info("Parsing XES via pm4py: %s", path)
+    xlog = xes_importer.apply(path)
+    m = FOCED()
+    for trace in xlog:
+        case_id = str(trace.attributes.get(DEFAULT_TRACEID_KEY, str(uuid.uuid4())))
+        # Case object
+        m.add_object(case_id, "Case", attrs={"concept:name": case_id})
+
+        for ev in trace:
+            ts = ev.get(DEFAULT_TIMESTAMP_KEY)
+            ts_iso = ts.isoformat() if ts else None
+            act = str(ev.get(DEFAULT_NAME_KEY, "UNNAMED"))
+            attrs = {str(k): str(v) for k, v in ev.items()
+                     if k not in {DEFAULT_TIMESTAMP_KEY, DEFAULT_NAME_KEY}}
+
+            # Create event
+            e_id = m.add_event(activity=act, timestamp=ts_iso, attrs=attrs)
+
+            # Link to Case
+            m.link_event_object(e_id, case_id, role="case")
+
+            # Derive additional objects from attributes and link
+            _derive_xes_extra_objects(m, e_id, attrs)
+    return m
+
+def parse_xes_fallback(path: str) -> FOCED:
+    log.info("Parsing XES via XML fallback: %s", path)
+    ns = {'xes': 'http://www.xes-standard.org/'}
+    tree = ET.parse(path)
+    root = tree.getroot()
+    m = FOCED()
+    trace_i = 0
+    for trace in root.findall('xes:trace', ns):
+        trace_i += 1
+        case_id = None
+        for s in trace.findall('xes:string', ns):
+            if s.attrib.get('key') == 'concept:name':
+                case_id = s.attrib.get('value')
+                break
+        if not case_id:
+            case_id = f"Trace_{uuid.uuid4()}"
+            log.warning("Trace #%d missing concept:name; generated %s", trace_i, case_id)
+        m.add_object(case_id, "Case", attrs={"concept:name": case_id})
+
+        for event in trace.findall('xes:event', ns):
+            activity, timestamp, attrs = None, None, {}
+            for child in event:
+                key = child.attrib.get('key')
+                value = child.attrib.get('value')
+                if key == 'concept:name':
+                    activity = str(value)
+                elif key == 'time:timestamp':
+                    timestamp = str(value)
+                else:
+                    attrs[str(key)] = str(value)
+
+            e_id = m.add_event(activity or "UNNAMED", timestamp, attrs)
+            m.link_event_object(e_id, case_id, role="case")
+            _derive_xes_extra_objects(m, e_id, attrs)
+    return m
+
+def parse_ocel_json_pm4py(path: str) -> FOCED:
+    log.info("Parsing OCEL via pm4py: %s", path)
+    ocel = ocel_json_importer.apply(path)
+    m = FOCED()
+
+    # Objects
+    for row in ocel.objects.itertuples(index=False):
+        props = dict(row.properties) if hasattr(row, "properties") and isinstance(row.properties, dict) else {}
+        props = {str(k): str(v) for k, v in props.items()}
+        m.add_object(str(row.object_id), str(row.type), attrs=props)
+
+    # Events
+    ev_id_map: Dict[str, str] = {}
+    for row in ocel.events.itertuples(index=False):
+        props = dict(row.properties) if hasattr(row, "properties") and isinstance(row.properties, dict) else {}
+        props = {str(k): str(v) for k, v in props.items()}
+        ts = row.timestamp.isoformat() if getattr(row, "timestamp", None) else None
+        e_id = m.add_event(activity=str(row.activity), timestamp=ts, attrs=props)
+        ev_id_map[str(row.event_id)] = e_id
+
+    # Links
+    for row in ocel.relations.itertuples(index=False):
+        role = getattr(row, "qualifier", None) or getattr(row, "role", None)
+        ev = ev_id_map.get(str(row.event_id))
+        obj_id = str(row.object_id)
+        if ev and obj_id in m.objects:
+            m.link_event_object(ev, obj_id, role=str(role) if role else None)
+
+    return m
+
+def load_input(path: str) -> FOCED:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xes":
+        return parse_xes_pm4py(path) if PM4PY_XES else parse_xes_fallback(path)
+    elif ext in {".jsonocel", ".ocel.json"}:
+        if not PM4PY_OCEL:
+            raise RuntimeError("pm4py OCEL importer not available. Install pm4py >= 2.7+.")
+        return parse_ocel_json_pm4py(path)
+    else:
+        raise ValueError(f"Unsupported input type: {ext}")
+
+# -------------------
+# Backup
+# -------------------
+def backup_model(model: FOCED, base_dir: str = BACKUP_DIR) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = os.path.join(base_dir, f"foced_backup_{ts}.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({
+            "events": model.events,
+            "objects": list(model.objects.values()),
+            "event_object": model.event_object
+        }, f, ensure_ascii=False, indent=2)
+    log.info("Backup written: %s", out)
+    return out
+
+# -------------------
+# Neo4j writer (object-centric)
+# -------------------
+def setup_database(driver):
+    with driver.session() as s:
+        s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (o:Object) REQUIRE o.id IS UNIQUE")
+        s.run("CREATE INDEX IF NOT EXISTS FOR (o:Object) ON (o.type)")
+        s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Event) REQUIRE e.id IS UNIQUE")
+        s.run("CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.activity)")
+        s.run("CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.timestamp)")
+
+def write_object_batches(tx, objects: List[Dict[str, Any]]):
+    tx.run("""
+        UNWIND $batch AS row
+        MERGE (o:Object {id: row.id})
+        SET o.type = row.type,
+            o += row.attrs
+    """, batch=objects)
+
+def write_event_batches(tx, events: List[Dict[str, Any]]):
+    tx.run("""
+        UNWIND $batch AS row
+        MERGE (e:Event {id: row.id})
+        SET e.activity = row.activity,
+            e.timestamp = row.timestamp,
+            e += row.attrs
+    """, batch=events)
+
+def write_links_batches(tx, links: List[Dict[str, Any]]):
+    tx.run("""
+        UNWIND $batch AS row
+        MATCH (e:Event {id: row.event_id})
+        MATCH (o:Object {id: row.object_id})
+        MERGE (e)-[r:INVOLVES]->(o)
+        SET r.role = coalesce(row.role, r.role)
+    """, batch=links)
+
+def load_to_neo4j(driver, model: FOCED):
+    setup_database(driver)
+    with driver.session() as s:
+        objs = list(model.objects.values())
+        for i in range(0, len(objs), BATCH_SIZE):
+            s.execute_write(write_object_batches, objs[i:i+BATCH_SIZE])
+
+        evs = model.events
+        for i in range(0, len(evs), BATCH_SIZE):
+            s.execute_write(write_event_batches, evs[i:i+BATCH_SIZE])
+
+        lnks = model.event_object
+        for i in range(0, len(lnks), BATCH_SIZE):
+            s.execute_write(write_links_batches, lnks[i:i+BATCH_SIZE])
+
+# -------------------
+# Example Cypher queries (Neo4j 5 safe)
+# -------------------
+EXAMPLE_QUERIES = [
+    ("Events per object",
+     """
+     MATCH (o:Object)<-[:INVOLVES]-(e:Event)
+     RETURN o.id AS object_id, o.type AS object_type, count(e) AS events
+     ORDER BY events DESC
+     LIMIT 10
+     """),
+
+    ("Objects co-involved in same event",
+     """
+     MATCH (e:Event)-[:INVOLVES]->(o1:Object),
+           (e)-[:INVOLVES]->(o2:Object)
+     WHERE o1.id < o2.id
+     RETURN e.id AS event_id, o1.id AS objA, o2.id AS objB
+     LIMIT 20
+     """),
+
+    ("Temporal activity sequence per object",
+     """
+     MATCH (o:Object)<-[:INVOLVES]-(e:Event)
+     WHERE e.timestamp IS NOT NULL
+     WITH o, e ORDER BY o.id, e.timestamp
+     RETURN o.id AS object_id, collect(e.activity) AS activities
+     LIMIT 10
+     """),
+]
+
+def run_example_queries(driver):
+    with driver.session() as s:
+        for title, q in EXAMPLE_QUERIES:
+            res = s.run(q).data()
+            print(f"\n-- {title} --")
+            for row in res[:5]:
+                print(row)
+
+# -------------------
+# Main
+# -------------------
+def main():
+    print("Starting object-centric pipeline (no Alloy runtime)...")
+    log.info("=== START ===")
+
+    print(f"Loading input: {INPUT_FILE}")
+    t0 = time.time()
+    model = load_input(INPUT_FILE)
+    print(f"Loaded: {len(model.events)} events, {len(model.objects)} objects, {len(model.event_object)} links in {time.time()-t0:.2f}s")
+
+    # Enforce Alloy-model logic in Python
+    print("Enforcing attribute validity, time ordering, and max observes per event...")
+    enforce_alloy_logic(model, max_observes=MAX_OBSERVES_PER_EVENT)
+
+    # Backup
+    backup_path = backup_model(model)
+    print(f"Backup saved: {backup_path}")
+
+    # Neo4j load
+    print("Connecting to Neo4j...")
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    try:
+        start = time.time()
+        print("Writing object-centric graph...")
+        load_to_neo4j(driver, model)
+        print(f"Graph load completed in {time.time() - start:.2f}s")
+
+        # Example queries
+        print("Running example Cypher queries (top rows)...")
+        run_example_queries(driver)
+    finally:
+        driver.close()
+        print("Neo4j connection closed.")
+        log.info("=== END ===")
+
+if __name__ == "__main__":
+    main()
